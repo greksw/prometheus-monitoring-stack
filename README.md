@@ -82,8 +82,8 @@ Grafana is installed from Grafana's official APT repository and therefore follow
 Clone the repository and run the installer as root:
 
 ```bash
-git clone https://github.com/greksw/auto_prometheus.git
-cd auto_prometheus
+git clone https://github.com/greksw/prometheus-monitoring-stack.git
+cd prometheus-monitoring-stack
 sudo ./auto_prometheus.sh
 ```
 
