@@ -1,258 +1,315 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 027
 
-# --- Конфигурация ---
-GRAFANA_DOMAIN="$(hostname -f)"
-PROMETHEUS_PASSWORD="$(openssl rand -hex 16)"
-EXPORTER_PASSWORD="$(openssl rand -hex 16)"
-FAIL2BAN_BANTIME="1h"
-FAIL2BAN_MAXRETRY="3"
-LOG_FILE="/var/log/monitoring_setup_$(date +%Y%m%d_%H%M%S).log"
+readonly PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-3.13.3}"
+readonly PROMETHEUS_SHA256="${PROMETHEUS_SHA256:-b349c732d8a853e657d0e7ae1bbad4d11b586615fb65fdc59d896b9f869c001e}"
+readonly NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION:-1.12.1}"
+readonly NODE_EXPORTER_SHA256="${NODE_EXPORTER_SHA256:-b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63}"
+readonly INSTALL_GRAFANA="${INSTALL_GRAFANA:-1}"
 
-# --- Функция проверки сервиса ---
-check_service() {
-    local service_name=$1
-    echo -n "Проверка $service_name... "
-    
-    if systemctl is-active --quiet "$service_name"; then
-        echo "OK"
-    else
-        echo "ОШИБКА"
-        echo "Статус $service_name:"
-        systemctl status "$service_name" --no-pager
-        journalctl -u "$service_name" -n 20 --no-pager
-        exit 1
+readonly PROMETHEUS_USER="prometheus"
+readonly NODE_EXPORTER_USER="node_exporter"
+readonly PROMETHEUS_CONFIG_DIR="/etc/prometheus"
+readonly PROMETHEUS_DATA_DIR="/var/lib/prometheus"
+readonly GRAFANA_ADMIN_PASSWORD_FILE="/etc/grafana/admin-password"
+
+TMP_DIR=""
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+fatal() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
+        rm -rf -- "${TMP_DIR}"
     fi
 }
 
-# --- Инициализация ---
-exec > >(tee -a "$LOG_FILE") 2>&1
-echo "📅 Начало установки: $(date)"
-
-# --- Установка зависимостей ---
-echo "🔄 Установка базовых пакетов..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -q && apt-get install -yq \
-    wget curl ufw fail2ban openssl \
-    apache2-utils python3 software-properties-common \
-    gnupg2 apt-transport-https
-
-# --- Настройка firewall ---
-echo "🔥 Настройка firewall..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow ssh
-ufw allow 443/tcp
-ufw allow 9090/tcp
-ufw allow 9100/tcp
-echo "y" | ufw enable
-ufw status verbose
-
-# --- Генерация SSL сертификатов ---
-echo "🔐 Генерация SSL сертификатов..."
-mkdir -p /etc/ssl/private
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-    -keyout /etc/ssl/private/monitoring.key \
-    -out /etc/ssl/private/monitoring.crt \
-    -subj "/CN=$GRAFANA_DOMAIN/O=Secure Monitoring/OU=DevOps"
-chmod 644 /etc/ssl/private/monitoring.crt
-chmod 640 /etc/ssl/private/monitoring.key
-chown root:grafana /etc/ssl/private/monitoring.key
-
-# --- Установка Prometheus ---
-echo "📊 Установка Prometheus..."
-useradd --system --no-create-home --shell /bin/false prometheus || true
-
-PROM_VERSION="2.47.0"
-wget -q "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
-tar xf prometheus-*.tar.gz -C /opt/
-mv /opt/prometheus-* /opt/prometheus
-rm prometheus-*.tar.gz
-
-# Создаем необходимые директории
-mkdir -p /opt/prometheus/data
-chown -R prometheus:prometheus /opt/prometheus
-
-# Конфигурация
-cat > /opt/prometheus/prometheus.yml <<EOF
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'node'
-    static_configs:
-      - targets: ['localhost:9100']
-    basic_auth:
-      username: exporter
-      password: '$EXPORTER_PASSWORD'
-EOF
-
-# Аутентификация
-htpasswd -b -c /opt/prometheus/web.yml admin "$PROMETHEUS_PASSWORD" || {
-    apt-get install -yq apache2-utils
-    htpasswd -b -c /opt/prometheus/web.yml admin "$PROMETHEUS_PASSWORD"
+on_error() {
+    local exit_code=$?
+    local line_no=${1:-unknown}
+    printf 'ERROR: installer failed at line %s (exit code %s)\n' "${line_no}" "${exit_code}" >&2
+    exit "${exit_code}"
 }
 
-chown prometheus:prometheus /opt/prometheus/web.yml
+trap cleanup EXIT
+trap 'on_error ${LINENO}' ERR
 
-# Systemd сервис
-cat > /etc/systemd/system/prometheus.service <<EOF
+require_root() {
+    [[ ${EUID} -eq 0 ]] || fatal 'Run this installer as root.'
+}
+
+check_platform() {
+    [[ -r /etc/os-release ]] || fatal '/etc/os-release is missing.'
+    # shellcheck disable=SC1091
+    source /etc/os-release
+
+    case "${ID:-}" in
+        ubuntu|debian) ;;
+        *) fatal "Unsupported operating system: ${ID:-unknown}. Supported: Debian and Ubuntu." ;;
+    esac
+
+    case "$(uname -m)" in
+        x86_64) ;;
+        *) fatal 'This release currently supports x86_64/amd64 only.' ;;
+    esac
+}
+
+install_prerequisites() {
+    log 'Installing prerequisite packages.'
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        openssl \
+        tar
+}
+
+ensure_system_user() {
+    local user_name=$1
+    local home_dir=$2
+
+    if ! id "${user_name}" >/dev/null 2>&1; then
+        useradd \
+            --system \
+            --home-dir "${home_dir}" \
+            --no-create-home \
+            --shell /usr/sbin/nologin \
+            "${user_name}"
+    fi
+}
+
+download_and_verify() {
+    local url=$1
+    local destination=$2
+    local expected_sha256=$3
+
+    curl --fail --location --show-error --silent \
+        --retry 3 --retry-delay 2 \
+        --output "${destination}" \
+        "${url}"
+
+    printf '%s  %s\n' "${expected_sha256}" "${destination}" | sha256sum --check --status \
+        || fatal "Checksum verification failed for ${destination}."
+}
+
+install_prometheus() {
+    local archive="${TMP_DIR}/prometheus.tar.gz"
+    local extracted_dir="${TMP_DIR}/prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+    local url="https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+
+    log "Installing Prometheus ${PROMETHEUS_VERSION}."
+    ensure_system_user "${PROMETHEUS_USER}" "${PROMETHEUS_DATA_DIR}"
+
+    download_and_verify "${url}" "${archive}" "${PROMETHEUS_SHA256}"
+    tar -xzf "${archive}" -C "${TMP_DIR}"
+
+    install -m 0755 "${extracted_dir}/prometheus" /usr/local/bin/prometheus
+    install -m 0755 "${extracted_dir}/promtool" /usr/local/bin/promtool
+
+    install -d -m 0750 -o root -g "${PROMETHEUS_USER}" "${PROMETHEUS_CONFIG_DIR}"
+    install -d -m 0750 -o "${PROMETHEUS_USER}" -g "${PROMETHEUS_USER}" "${PROMETHEUS_DATA_DIR}"
+
+    cat > "${PROMETHEUS_CONFIG_DIR}/prometheus.yml" <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: node
+    static_configs:
+      - targets:
+          - 127.0.0.1:9100
+EOF
+
+    chown root:"${PROMETHEUS_USER}" "${PROMETHEUS_CONFIG_DIR}/prometheus.yml"
+    chmod 0640 "${PROMETHEUS_CONFIG_DIR}/prometheus.yml"
+
+    cat > /etc/systemd/system/prometheus.service <<EOF
 [Unit]
-Description=Prometheus
+Description=Prometheus Monitoring Server
+Documentation=https://prometheus.io/docs/
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-User=prometheus
-Group=prometheus
-ExecStart=/opt/prometheus/prometheus \\
-    --config.file=/opt/prometheus/prometheus.yml \\
-    --web.config.file=/opt/prometheus/web.yml \\
-    --web.listen-address=:9090 \\
-    --storage.tsdb.path=/opt/prometheus/data \\
-    --web.external-url=https://$GRAFANA_DOMAIN:9090 \\
-    --query.log-file=""
-Restart=always
+Type=simple
+User=${PROMETHEUS_USER}
+Group=${PROMETHEUS_USER}
+ExecStart=/usr/local/bin/prometheus \\
+  --config.file=${PROMETHEUS_CONFIG_DIR}/prometheus.yml \\
+  --storage.tsdb.path=${PROMETHEUS_DATA_DIR} \\
+  --web.listen-address=127.0.0.1:9090
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now prometheus
-check_service prometheus
-
-# --- Установка Node Exporter ---
-echo "🖥️ Установка Node Exporter..."
-useradd --system --no-create-home --shell /bin/false node_exporter || true
-
-NODE_VERSION="1.6.1"
-wget -q "https://github.com/prometheus/node_exporter/releases/download/v${NODE_VERSION}/node_exporter-${NODE_VERSION}.linux-amd64.tar.gz"
-tar xf node_exporter-*.tar.gz
-mv node_exporter-*/node_exporter /usr/local/bin/
-rm -rf node_exporter-*
-
-# Аутентификация
-mkdir -p /etc/node_exporter
-echo "exporter:$(openssl passwd -apr1 $EXPORTER_PASSWORD)" > /etc/node_exporter/web.yml
-chown node_exporter:node_exporter /etc/node_exporter/web.yml
-
-# Systemd сервис
-cat > /etc/systemd/system/node_exporter.service <<EOF
-[Unit]
-Description=Node Exporter
-After=network.target
-
-[Service]
-User=node_exporter
-Group=node_exporter
-ExecStart=/usr/local/bin/node_exporter \\
-    --web.config.file=/etc/node_exporter/web.yml \\
-    --web.listen-address=:9100
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl enable --now node_exporter
-check_service node_exporter
-
-# --- Установка Grafana ---
-echo "📈 Установка Grafana..."
-# Установка из официального репозитория
-apt-get install -yq gnupg2
-curl -fsSL https://packages.grafana.com/gpg.key | gpg --dearmor > /usr/share/keyrings/grafana-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/grafana-archive-keyring.gpg] https://packages.grafana.com/oss/deb stable main" > /etc/apt/sources.list.d/grafana.list
-apt-get update -q && apt-get install -yq grafana
-
-# Альтернативный метод если репозиторий недоступен
-if ! apt-get install -yq grafana; then
-    echo "⚠️ Используем альтернативный метод установки Grafana"
-    GRAFANA_VERSION="10.4.3"
-    wget -q "https://dl.grafana.com/oss/release/grafana_${GRAFANA_VERSION}_amd64.deb"
-    dpkg -i grafana_*.deb || apt-get install -yf
-    rm grafana_*.deb
-fi
-
-# Конфигурация Grafana
-cat > /etc/grafana/grafana.ini <<EOF
-[server]
-protocol = http
-http_port = 3000
-domain = $GRAFANA_DOMAIN
-
-[security]
-disable_initial_admin_creation = false
-admin_user = admin
-admin_password = $(openssl rand -hex 12)
-EOF
-
-# Права на сертификаты
-chown -R grafana:grafana /etc/ssl/private
-systemctl enable --now grafana-server
-check_service grafana-server
-
-# --- Настройка Fail2Ban ---
-echo "🛡️ Настройка Fail2Ban..."
-cat > /etc/fail2ban/jail.d/monitoring.conf <<EOF
-[grafana]
-enabled = true
-port = http,https,3000
-filter = grafana
-logpath = /var/log/grafana/grafana.log
-maxretry = $FAIL2BAN_MAXRETRY
-bantime = $FAIL2BAN_BANTIME
-
-[prometheus]
-enabled = true
-port = 9090
-filter = prometheus
-logpath = /var/log/syslog
-maxretry = $FAIL2BAN_MAXRETRY
-bantime = $FAIL2BAN_BANTIME
-EOF
-
-cat > /etc/fail2ban/filter.d/grafana.conf <<EOF
-[Definition]
-failregex = ^.*Failed.* user=<HOST>.*
-ignoreregex =
-EOF
-
-cat > /etc/fail2ban/filter.d/prometheus.conf <<EOF
-[Definition]
-failregex = ^.*invalid username or password.* <HOST>
-ignoreregex =
-EOF
-
-systemctl restart fail2ban
-check_service fail2ban
-
-# --- Проверка портов ---
-echo "🔍 Проверка открытых портов..."
-ss -tulnp | grep -E '9090|3000|9100' || {
-    echo "⚠️ Не все порты открыты!"
-    exit 1
+    /usr/local/bin/promtool check config "${PROMETHEUS_CONFIG_DIR}/prometheus.yml"
 }
 
-# --- Итоговая информация ---
-GRAFANA_PASSWORD=$(grep 'admin_password' /etc/grafana/grafana.ini | cut -d' ' -f3)
-echo "
-🎉 Установка завершена и проверена!
+install_node_exporter() {
+    local archive="${TMP_DIR}/node_exporter.tar.gz"
+    local extracted_dir="${TMP_DIR}/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64"
+    local url="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64.tar.gz"
 
-🔗 Доступ к сервисам:
-- Prometheus:  http://$(hostname -I | awk '{print $1}'):9090
-  Логин: admin
-  Пароль: $PROMETHEUS_PASSWORD
+    log "Installing node_exporter ${NODE_EXPORTER_VERSION}."
+    ensure_system_user "${NODE_EXPORTER_USER}" "/nonexistent"
 
-- Grafana:     http://$(hostname -I | awk '{print $1}'):3000
-  Логин: admin
-  Пароль: $GRAFANA_PASSWORD
+    download_and_verify "${url}" "${archive}" "${NODE_EXPORTER_SHA256}"
+    tar -xzf "${archive}" -C "${TMP_DIR}"
+    install -m 0755 "${extracted_dir}/node_exporter" /usr/local/bin/node_exporter
 
-- Node Exporter: http://$(hostname -I | awk '{print $1}'):9100/metrics
-  Логин: exporter
-  Пароль: $EXPORTER_PASSWORD
+    cat > /etc/systemd/system/node_exporter.service <<EOF
+[Unit]
+Description=Prometheus Node Exporter
+Documentation=https://github.com/prometheus/node_exporter
+Wants=network-online.target
+After=network-online.target
 
-📋 Лог установки: $LOG_FILE
-"
+[Service]
+Type=simple
+User=${NODE_EXPORTER_USER}
+Group=${NODE_EXPORTER_USER}
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=127.0.0.1:9100
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_grafana() {
+    [[ "${INSTALL_GRAFANA}" == "1" ]] || {
+        log 'Grafana installation disabled (INSTALL_GRAFANA=0).'
+        return
+    }
+
+    log 'Installing Grafana OSS from the official APT repository.'
+    install -d -m 0755 /etc/apt/keyrings
+    curl --fail --location --show-error --silent \
+        https://apt.grafana.com/gpg-full.key \
+        -o /etc/apt/keyrings/grafana.asc
+    chmod 0644 /etc/apt/keyrings/grafana.asc
+
+    cat > /etc/apt/sources.list.d/grafana.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main
+EOF
+
+    apt-get update
+    apt-get install -y --no-install-recommends grafana
+
+    if [[ ! -s "${GRAFANA_ADMIN_PASSWORD_FILE}" ]]; then
+        openssl rand -base64 32 > "${GRAFANA_ADMIN_PASSWORD_FILE}"
+    fi
+    chown root:grafana "${GRAFANA_ADMIN_PASSWORD_FILE}"
+    chmod 0640 "${GRAFANA_ADMIN_PASSWORD_FILE}"
+
+    install -d -m 0755 /etc/systemd/system/grafana-server.service.d
+    cat > /etc/systemd/system/grafana-server.service.d/10-security.conf <<EOF
+[Service]
+Environment="GF_SERVER_HTTP_ADDR=127.0.0.1"
+Environment="GF_USERS_ALLOW_SIGN_UP=false"
+Environment="GF_SECURITY_ADMIN_USER=admin"
+Environment="GF_SECURITY_ADMIN_PASSWORD=\$__file{${GRAFANA_ADMIN_PASSWORD_FILE}}"
+EOF
+
+    install -d -m 0755 /etc/grafana/provisioning/datasources
+    cat > /etc/grafana/provisioning/datasources/prometheus.yml <<'EOF'
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: false
+EOF
+}
+
+start_services() {
+    log 'Starting monitoring services.'
+    systemctl daemon-reload
+    systemctl enable --now node_exporter
+    systemctl enable --now prometheus
+
+    if [[ "${INSTALL_GRAFANA}" == "1" ]]; then
+        systemctl enable --now grafana-server
+    fi
+}
+
+verify_services() {
+    log 'Verifying service state and local endpoints.'
+
+    systemctl is-active --quiet node_exporter || fatal 'node_exporter is not active.'
+    systemctl is-active --quiet prometheus || fatal 'Prometheus is not active.'
+
+    curl --fail --silent --show-error http://127.0.0.1:9100/metrics >/dev/null
+    curl --fail --silent --show-error http://127.0.0.1:9090/-/ready >/dev/null
+
+    if [[ "${INSTALL_GRAFANA}" == "1" ]]; then
+        systemctl is-active --quiet grafana-server || fatal 'Grafana is not active.'
+        curl --fail --silent --show-error http://127.0.0.1:3000/api/health >/dev/null
+    fi
+}
+
+print_summary() {
+    cat <<EOF
+
+Monitoring stack installation completed successfully.
+
+Local endpoints:
+  Prometheus:    http://127.0.0.1:9090
+  node_exporter: http://127.0.0.1:9100
+EOF
+
+    if [[ "${INSTALL_GRAFANA}" == "1" ]]; then
+        cat <<EOF
+  Grafana:       http://127.0.0.1:3000
+
+Grafana credentials:
+  User: admin
+  Password file: ${GRAFANA_ADMIN_PASSWORD_FILE}
+
+The services listen on loopback by default. Use an SSH tunnel or a separately
+managed reverse proxy/TLS endpoint instead of exposing metrics ports directly.
+EOF
+    fi
+}
+
+main() {
+    require_root
+    check_platform
+    TMP_DIR=$(mktemp -d)
+
+    install_prerequisites
+    install_prometheus
+    install_node_exporter
+    install_grafana
+    start_services
+    verify_services
+    print_summary
+}
+
+main "$@"
